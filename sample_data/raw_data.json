@@ -1,0 +1,14 @@
+[
+  {
+    "id": "1",
+    "name": "alpha",
+    "amount": 125.50,
+    "last_updated": "2025-01-01T08:30:00Z"
+  },
+  {
+    "id": "2",
+    "name": "beta",
+    "amount": 210.75,
+    "last_updated": "2025-01-02T11:45:00Z"
+  }
+]
