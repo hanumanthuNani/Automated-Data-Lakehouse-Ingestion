@@ -3,29 +3,26 @@ Incremental ingestion job: processes new/updated records using a watermark on la
 """
 
 import argparse
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
 from pyspark.sql import Window
 from pyspark.sql.functions import col, lit, max as spark_max, row_number, to_timestamp
 
-from spark.spark_utils import add_audit_columns, get_spark_session, load_config, read_raw_data, write_partitioned_data
+from spark.spark_utils import (
+    add_audit_columns,
+    build_spark_session,
+    load_config,
+    read_raw_data,
+    write_partitioned_data,
+)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Incremental ingestion for lakehouse")
     parser.add_argument("--config", default="config/ingestion.conf", help="Path to ingestion configuration file")
     return parser.parse_args()
-
-
-def build_spark(conf) -> object:
-    compression = conf["formats"].get("compression", "snappy")
-    spark_conf = {
-        "spark.sql.sources.partitionOverwriteMode": "dynamic",
-        "spark.sql.parquet.compression.codec": compression,
-        "spark.sql.orc.compression.codec": compression,
-    }
-    return get_spark_session("incremental_ingestion", spark_conf)
 
 
 def load_watermark(path: Optional[str]) -> Optional[str]:
@@ -42,29 +39,48 @@ def persist_watermark(path: Optional[str], value: str) -> None:
     watermark_file.write_text(value, encoding="utf-8")
 
 
+def resolve_max_timestamp(row):
+    if row and row["max_ts"] is not None:
+        return row["max_ts"]
+    return datetime.utcnow()
+
+
 def main() -> None:
     args = parse_args()
     config = load_config(args.config)
 
-    input_path = config["paths"]["s3_raw_path"]
-    output_path = config["paths"]["hdfs_processed_path"]
-    input_format = config["formats"].get("input_format", "json")
-    output_format = config["formats"].get("output_format", "parquet")
-    compression = config["formats"].get("compression", "snappy")
-    watermark_path = config["incremental"].get("watermark_path", "checkpoints/last_watermark.txt")
+    input_path = config.get("paths", "s3_raw_path", fallback=None)
+    output_path = config.get("paths", "hdfs_processed_path", fallback=None)
+    if not input_path or not output_path:
+        raise ValueError("Both paths.s3_raw_path and paths.hdfs_processed_path must be configured")
 
-    spark = build_spark(config)
+    input_format = config.get("formats", "input_format", fallback="json")
+    output_format = config.get("formats", "output_format", fallback="parquet")
+    compression = config.get("formats", "compression", fallback="snappy")
+    watermark_path = config.get("incremental", "watermark_path", fallback="checkpoints/last_watermark.txt")
+    business_key = config.get("schema", "business_key", fallback="id")
+
+    spark = build_spark_session("incremental_ingestion", config)
 
     raw_df = read_raw_data(spark, input_path, input_format)
-    staged = raw_df.withColumn("last_updated", to_timestamp(col("last_updated")))
+    staged = raw_df.dropna(subset=[business_key]).withColumn("last_updated", to_timestamp(col("last_updated")))
 
     watermark = load_watermark(watermark_path)
     if watermark:
-        staged = staged.filter(col("last_updated") > to_timestamp(lit(watermark)))
+        staged = staged.filter(col("last_updated") >= to_timestamp(lit(watermark)))
 
-    window_spec = Window.partitionBy("id").orderBy(col("last_updated").desc_nulls_last())
+    window_spec = Window.partitionBy(business_key).orderBy(col("last_updated").desc_nulls_last())
     deduped = staged.withColumn("rn", row_number().over(window_spec)).filter(col("rn") == 1).drop("rn")
     enriched = add_audit_columns(deduped)
+    if enriched.isEmpty():
+        print("No new incremental data to process; exiting.")
+        return
+
+    enriched = enriched.cache()
+
+    agg_row = enriched.agg(spark_max("last_updated").alias("max_ts")).first()
+
+    max_last_updated = resolve_max_timestamp(agg_row)
 
     write_partitioned_data(
         enriched,
@@ -75,9 +91,8 @@ def main() -> None:
         compression=compression,
     )
 
-    max_last_updated = enriched.agg(spark_max("last_updated").alias("max_ts")).first()["max_ts"]
-    if max_last_updated:
-        persist_watermark(watermark_path, str(max_last_updated))
+    enriched.unpersist()
+    persist_watermark(watermark_path, str(max_last_updated))
 
 
 if __name__ == "__main__":

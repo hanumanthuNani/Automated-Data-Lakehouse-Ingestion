@@ -13,16 +13,25 @@ provider "aws" {
 
 resource "aws_s3_bucket" "raw_data" {
   bucket = var.raw_bucket_name
+}
 
-  versioning {
-    enabled = true
+resource "aws_s3_bucket_versioning" "raw_data" {
+  bucket = aws_s3_bucket.raw_data.id
+
+  versioning_configuration {
+    status = "Enabled"
   }
+}
 
-  lifecycle_rule {
-    id      = "retain-raw"
-    enabled = true
+resource "aws_s3_bucket_lifecycle_configuration" "raw_data" {
+  bucket = aws_s3_bucket.raw_data.id
+
+  rule {
+    id     = "retain-raw"
+    status = "Enabled"
+
     noncurrent_version_expiration {
-      days = 30
+      noncurrent_days = 30
     }
   }
 }

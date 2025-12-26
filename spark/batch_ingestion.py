@@ -6,7 +6,13 @@ import argparse
 from pyspark.sql import Window
 from pyspark.sql.functions import col, row_number, to_timestamp
 
-from spark.spark_utils import add_audit_columns, get_spark_session, load_config, read_raw_data, write_partitioned_data
+from spark.spark_utils import (
+    add_audit_columns,
+    build_spark_session,
+    load_config,
+    read_raw_data,
+    write_partitioned_data,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -15,37 +21,31 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def build_spark(conf) -> object:
-    compression = conf["formats"].get("compression", "snappy")
-    spark_conf = {
-        "spark.sql.sources.partitionOverwriteMode": "dynamic",
-        "spark.sql.parquet.compression.codec": compression,
-        "spark.sql.orc.compression.codec": compression,
-    }
-    return get_spark_session("batch_ingestion", spark_conf)
-
-
 def main() -> None:
     args = parse_args()
     config = load_config(args.config)
 
-    input_path = config["paths"]["s3_raw_path"]
-    output_path = config["paths"]["hdfs_processed_path"]
-    input_format = config["formats"].get("input_format", "json")
-    output_format = config["formats"].get("output_format", "parquet")
-    compression = config["formats"].get("compression", "snappy")
+    input_path = config.get("paths", "s3_raw_path", fallback=None)
+    output_path = config.get("paths", "hdfs_processed_path", fallback=None)
+    if not input_path or not output_path:
+        raise ValueError("Both paths.s3_raw_path and paths.hdfs_processed_path must be configured")
 
-    spark = build_spark(config)
+    input_format = config.get("formats", "input_format", fallback="json")
+    output_format = config.get("formats", "output_format", fallback="parquet")
+    compression = config.get("formats", "compression", fallback="snappy")
+    business_key = config.get("schema", "business_key", fallback="id")
+
+    spark = build_spark_session("batch_ingestion", config)
 
     # Read raw data and enforce timestamp typing for downstream pruning and deduplication.
     raw_df = read_raw_data(spark, input_path, input_format)
     cleaned = (
-        raw_df.dropna(subset=["id"])
+        raw_df.dropna(subset=[business_key])
         .withColumn("last_updated", to_timestamp(col("last_updated")))
     )
 
     # Deduplicate by latest last_updated per business key.
-    window_spec = Window.partitionBy("id").orderBy(col("last_updated").desc_nulls_last())
+    window_spec = Window.partitionBy(business_key).orderBy(col("last_updated").desc_nulls_last())
     deduped = cleaned.withColumn("rn", row_number().over(window_spec)).filter(col("rn") == 1).drop("rn")
 
     enriched = add_audit_columns(deduped)
